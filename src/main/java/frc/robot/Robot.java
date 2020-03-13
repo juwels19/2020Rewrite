@@ -7,6 +7,7 @@
 
 package frc.robot;
 
+import com.ctre.phoenix.motorcontrol.can.WPI_VictorSPX;
 import com.kauailabs.navx.frc.AHRS;
 import com.revrobotics.CANEncoder;
 import com.revrobotics.CANSparkMax;
@@ -21,6 +22,7 @@ import edu.wpi.first.wpilibj.DriverStation;
 import edu.wpi.first.wpilibj.SerialPort;
 import edu.wpi.first.wpilibj.TimedRobot;
 import edu.wpi.first.wpilibj.XboxController;
+import edu.wpi.first.wpilibj.controller.PIDController;
 import edu.wpi.first.wpilibj.geometry.Rotation2d;
 import edu.wpi.first.wpilibj.kinematics.DifferentialDriveOdometry;
 import edu.wpi.first.wpilibj.smartdashboard.SendableChooser;
@@ -36,16 +38,24 @@ public class Robot extends TimedRobot {
   private CANSparkMax leftSlave = new CANSparkMax(Constants.DRIVE_LEFT_SLAVE_CAN_ID, MotorType.kBrushless);
   private CANSparkMax rightMaster = new CANSparkMax(Constants.DRIVE_RIGHT_MASTER_CAN_ID, MotorType.kBrushless);
   private CANSparkMax rightSlave = new CANSparkMax(Constants.DRIVE_RIGHT_SLAVE_CAN_ID, MotorType.kBrushless);
-  private CANEncoder leftEnc = leftMaster.getEncoder();
-  private CANEncoder rightEnc = rightMaster.getEncoder();
+  private CANEncoder leftDriveEnc = leftMaster.getEncoder();
+  private CANEncoder rightDriveEnc = rightMaster.getEncoder();
   private AHRS navx = new AHRS(SerialPort.Port.kMXP);
   private DifferentialDriveOdometry odometry;
   private boolean isReversed = false;
   private double maxOutput = 1.0;
 
   // Intake
+  private WPI_VictorSPX sideRollers = new WPI_VictorSPX(Constants.SIDE_ROLLER_INTAKE_CAN_ID);
+  private WPI_VictorSPX elevatorMotor = new WPI_VictorSPX(Constants.ELEVATOR_MOTOR_CAN_ID);
+  private WPI_VictorSPX dingusMotor = new WPI_VictorSPX(Constants.DINGUS_MOTOR_CAN_ID);
 
   // Shooter
+  private CANSparkMax leftShooter = new CANSparkMax(Constants.LEFT_SHOOTER_CAN_ID, MotorType.kBrushless);
+  private CANSparkMax rightShooter = new CANSparkMax(Constants.RIGHT_SHOOTER_CAN_ID, MotorType.kBrushless);
+
+  private CANEncoder leftShooterEnc = leftShooter.getEncoder();
+  private CANEncoder rightShooterEnc = rightShooter.getEncoder();
 
   // Pneumatics
   private DoubleSolenoid intakeCyls = new DoubleSolenoid(Constants.INTAKE_CYLINDERS_FORWARD_PORT, Constants.INTAKE_CYLINDERS_REVERSE_PORT);
@@ -54,6 +64,8 @@ public class Robot extends TimedRobot {
   // Vision
   private NetworkTable limelight = NetworkTableInstance.getDefault().getTable("limelight");
   private double tx, ty, tv;
+  private PIDController throttlePID = new PIDController(0.055, 0.00, 0.0);
+  private PIDController yawPID = new PIDController(0.015, 0.02, 0.0);
 
   // LEDs
   private AddressableLED led = new AddressableLED(Constants.LED_PWM_PORT);
@@ -61,20 +73,22 @@ public class Robot extends TimedRobot {
   private String ledState = "disabled";
 
   // Auto
-  private static final String kDefaultAuto = "Default";
-  private static final String kCustomAuto = "My Auto";
+  private static final String defaultAuto = "Default";
+  private static final String sixBallAuto = "Six Ball Trench";
   private String m_autoSelected;
-  private final SendableChooser<String> m_chooser = new SendableChooser<>();
+  private final SendableChooser<String> autoChooser = new SendableChooser<>();
 
   @Override
   public void robotInit() {
     driveInit();
     visionInit();
+    shooterInit();
+    ledInit();
 
 
-    m_chooser.setDefaultOption("Default Auto", kDefaultAuto);
-    m_chooser.addOption("My Auto", kCustomAuto);
-    SmartDashboard.putData("Auto choices", m_chooser);
+    autoChooser.setDefaultOption("Basic Auto", defaultAuto);
+    autoChooser.addOption("Six Ball Trench", sixBallAuto);
+    SmartDashboard.putData("Auto Chooser", autoChooser);
   }
 
   /**
@@ -108,7 +122,7 @@ public class Robot extends TimedRobot {
 
   @Override
   public void autonomousInit() {
-    m_autoSelected = m_chooser.getSelected();
+    m_autoSelected = autoChooser.getSelected();
     // m_autoSelected = SmartDashboard.getString("Auto Selector", kDefaultAuto);
     System.out.println("Auto selected: " + m_autoSelected);
     ledAutoRunning();
@@ -117,10 +131,10 @@ public class Robot extends TimedRobot {
   @Override
   public void autonomousPeriodic() {
     switch (m_autoSelected) {
-      case kCustomAuto:
+      case sixBallAuto:
         // Put custom auto code here
         break;
-      case kDefaultAuto:
+      case defaultAuto:
       default:
         // Put default auto code here
         break;
@@ -135,6 +149,11 @@ public class Robot extends TimedRobot {
 
   @Override
   public void teleopPeriodic() {
+    if (driverController.getAButton()) {
+      visionAlign();
+    } else {
+      driveJoystick();
+    }
   }
 
   @Override
@@ -165,8 +184,8 @@ public class Robot extends TimedRobot {
     rightSlave.follow(rightMaster);
     leftSlave.follow(leftMaster);
 
-    leftEnc.setPositionConversionFactor(0.4); 
-    rightEnc.setPositionConversionFactor(0.4);
+    leftDriveEnc.setPositionConversionFactor(0.4); 
+    rightDriveEnc.setPositionConversionFactor(0.4);
 
     resetDriveEncoders();
     resetGyro();
@@ -182,7 +201,30 @@ public class Robot extends TimedRobot {
       leftMaster.set(maxOutput * (-throttle+yaw)); //-throttle+yaw
       rightMaster.set(maxOutput * (-throttle-yaw)); //-throttle-yaw
     }
-    
+  }
+
+  public void driveJoystick() {
+    double throttle = -driverController.getRawAxis(1);
+    double yaw = driverController.getRawAxis(4);
+    if (Math.abs(throttle) < Constants.DRIVER_CONTROLLER_DEADBAND) {
+      throttle = 0.0;
+    }
+    if (Math.abs(yaw) < Constants.DRIVER_CONTROLLER_DEADBAND) {
+      yaw = 0.0;
+    }
+    if (throttle > 1) {
+      throttle = 1;
+    }
+    if (throttle < -1) {
+      throttle = -1;
+    }
+    if (yaw > 1) {
+      yaw = 1;
+    }
+    if (yaw < -1) {
+      yaw = -1;
+    }
+    drive(throttle, yaw);
   }
 
   public boolean isReversed() {
@@ -194,8 +236,8 @@ public class Robot extends TimedRobot {
   }
 
   public void resetDriveEncoders() {
-    leftEnc.setPosition(0.0);
-    rightEnc.setPosition(0.0);
+    leftDriveEnc.setPosition(0.0);
+    rightDriveEnc.setPosition(0.0);
   }
 
   public void resetGyro() {
@@ -209,6 +251,50 @@ public class Robot extends TimedRobot {
 
 
 
+
+
+  // Intake Methods
+  public void intakeOn() {
+    sideRollers.set(-1.0);
+  }
+
+  public void intakeOff() {
+    sideRollers.set(0.0);
+  }
+
+  public void elevatorOn() {
+    elevatorMotor.set(0.6); // 0.6 at initiation
+  }
+
+  public void elevatorOff() {
+    elevatorMotor.set(0.0);
+  }
+
+  public void intakeAndElevate() {
+    sideRollers.set(-1.0);
+    elevatorMotor.set(0.5);
+    dingusMotor.set(-0.6);
+    }
+
+  public void intakeAndElevateOff() {
+    sideRollers.set(0.0);
+    elevatorMotor.set(0.0);
+    dingusMotor.set(0.0);
+  }
+
+
+
+
+  // Shooter Methods
+  public void shooterInit() {
+    rightShooter.restoreFactoryDefaults();
+    leftShooter.restoreFactoryDefaults();
+    rightShooter.setInverted(true);
+
+    SmartDashboard.putNumber("Left Shooter kP", 1/300);
+    SmartDashboard.putNumber("Right Shooter kP",  1/300);
+    SmartDashboard.putNumber("Target RPM", 3300);
+  }
 
 
 
@@ -246,8 +332,52 @@ public class Robot extends TimedRobot {
     return Math.abs(ty) < Constants.LIMELIGHT_THROTTLE_THRESHOLD;
   }
 
-  public boolean hasTarget() {
+  public boolean limelightHasTarget() {
     return tv == 1.0;
+  }
+
+  public void visionAlign() {
+    setLimelightCamMode(0.0);
+    setLimelightLED(3.0);
+
+    if (limelightHasTarget()) {
+      double throttle = throttlePID.calculate(ty, 0.0);
+      double yaw = 0.0;
+  
+      if (throttle > 1.0) {
+        throttle = 1.0;
+      }
+      if (throttle < -1.0) {
+        throttle = -1.0;
+      }
+      if (yaw > 1.0) {
+        yaw = 1.0;
+      }
+      if (yaw < -1.0) {
+        yaw = -1.0;
+      }
+  
+      if (isYAligned()) {
+        yaw = -yawPID.calculate(tx, 0.0);
+      }
+
+      if (isXAligned() && isYAligned()) {
+        throttle = 0.0;
+        yaw = 0.0;
+        ledAligned();
+      } else if (isXAligned()) {
+        yaw = 0.0;
+      } else if (isYAligned()) {
+        throttle = 0.0;
+      }
+      drive(throttle, yaw);
+    } else {
+      drive(0.0, 0.0);
+      ledTeleop();
+      setLimelightLED(1.0);
+      setLimelightCamMode(1.0);
+    }
+
   }
 
 
